@@ -121,11 +121,19 @@ def evaluate_retrieval(model, dataloader, device='cuda', mode='i2t', t2i_only=Fa
     return metrics
 
 
-def evaluate_retrieval_fused(model, dataloader_i2t, dataloader_t2i, device='cuda', alpha=0.5):
+def evaluate_retrieval_fused(
+    model,
+    dataloader_i2t,
+    dataloader_t2i,
+    device='cuda',
+    img_fuse_weight: float = 0.5,
+    txt_fuse_weight: float = 0.5,
+    l2_normalize_fused: bool = True,
+):
     """
     融合两个方向的信息进行一次性评估：
     - 先分别用 i2t 与 t2i 模式得到两个相似度矩阵
-    - 然后做分数级融合：sim_fused = alpha * sim_i2t + (1 - alpha) * sim_t2i
+    - 然后做特征级融合：将两分支的 img/txt 特征线性融合，再计算 sim_fused = img_fused @ txt_fused.T
     - 最终在 fused 相似度上计算检索指标（R@K / MRR / mAP）
     说明：这里的 i2t/t2i 指的是模型内部两个方向的 cross-attention，而非检索的行/列方向。
     """
@@ -154,12 +162,22 @@ def evaluate_retrieval_fused(model, dataloader_i2t, dataloader_t2i, device='cuda
     img_t2i = torch.cat(all_img_t2i, dim=0)  # [N, D]
     txt_t2i = torch.cat(all_txt_t2i, dim=0)  # [N, D]
 
-    # 两个方向各自的相似度矩阵
-    sim_i2t = img_i2t @ txt_i2t.T   # [N, N]
-    sim_t2i = img_t2i @ txt_t2i.T   # [N, N]
+    # 两个方向各自的相似度矩阵（来自不同 cross-attention 分支）
+    sim_i2t = img_i2t @ txt_i2t.T   # [N, N]，来自 i2t 分支
+    sim_t2i = img_t2i @ txt_t2i.T   # [N, N]，来自 t2i 分支
 
-    # 融合：线性加权（可调 alpha）
-    sim = alpha * sim_i2t + (1.0 - alpha) * sim_t2i
+    #sim = 0.5 * sim_i2t + 0.5 * sim_t2i
+
+    def _l2norm(x, eps: float = 1e-8):
+        return x / (x.norm(dim=1, keepdim=True) + eps)
+
+    # 融合：特征空间线性融合，再算相似度
+    img_fused = img_fuse_weight * img_i2t + (1.0 - img_fuse_weight) * img_t2i
+    txt_fused = txt_fuse_weight * txt_i2t + (1.0 - txt_fuse_weight) * txt_t2i
+    if l2_normalize_fused:
+        img_fused = _l2norm(img_fused)
+        txt_fused = _l2norm(txt_fused)
+    sim = img_fused @ txt_fused.T
 
     def recall_at_k(sim, k):
         N = sim.size(0)
@@ -204,14 +222,28 @@ def evaluate_retrieval_fused(model, dataloader_i2t, dataloader_t2i, device='cuda
         return sum(ap) / len(ap)
 
     metrics = {}
-    for k in [1, 5, 10]:
-        i2t, t2i = recall_at_k(sim, k)
-        metrics[f'R@{k}_fused_i2t'] = i2t
-        metrics[f'R@{k}_fused_t2i'] = t2i
-    metrics['MRR_fused_i2t'] = mean_reciprocal_rank(sim, 'i2t')
-    metrics['MRR_fused_t2i'] = mean_reciprocal_rank(sim, 't2i')
-    metrics['mAP_fused_i2t'] = mean_average_precision(sim, 'i2t')
-    metrics['mAP_fused_t2i'] = mean_average_precision(sim, 't2i')
+
+    def fill_metrics_for_sim(sim_mat, prefix):
+        """
+        对给定相似度矩阵 sim_mat 计算检索指标，并用 prefix 作为前缀区分来源：
+        - prefix='i2tBranch'：来自 i2t 分支的相似度矩阵
+        - prefix='t2iBranch'：来自 t2i 分支的相似度矩阵
+        - prefix='fused'    ：融合后的相似度矩阵
+        """
+        for k in [1, 5, 10]:
+            i2t, t2i = recall_at_k(sim_mat, k)
+            metrics[f'R@{k}_{prefix}_i2t'] = i2t
+            metrics[f'R@{k}_{prefix}_t2i'] = t2i
+        metrics[f'MRR_{prefix}_i2t'] = mean_reciprocal_rank(sim_mat, 'i2t')
+        metrics[f'MRR_{prefix}_t2i'] = mean_reciprocal_rank(sim_mat, 't2i')
+        metrics[f'mAP_{prefix}_i2t'] = mean_average_precision(sim_mat, 'i2t')
+        metrics[f'mAP_{prefix}_t2i'] = mean_average_precision(sim_mat, 't2i')
+
+    # 分别记录三个相似度矩阵的表现
+    fill_metrics_for_sim(sim_i2t, 'i2tBranch')
+    fill_metrics_for_sim(sim_t2i, 't2iBranch')
+    fill_metrics_for_sim(sim, 'fused')
+
     return metrics
 
 
@@ -330,19 +362,19 @@ if __name__ == '__main__':
     construct_time = time.time()
     # Build i2t pseudo-aligned datasets (image -> top-k texts)
     pseudo_aligned_train_set_i2t = EmbeddingDataset(
-        build_pseudo_aligned_dataset(unaligned_train_set, distance='PrivateHamming', topk=topk), mode='aligned')
+        build_pseudo_aligned_dataset(unaligned_train_set, distance='TPOneHot', topk=topk), mode='aligned')
     print('construct time (i2t):', time.time() - construct_time)
     construct_time = time.time()
     pseudo_aligned_test_set_i2t = EmbeddingDataset(
-        build_pseudo_aligned_dataset(aligned_test_set, distance='PrivateHamming', topk=topk),  mode='aligned')
+        build_pseudo_aligned_dataset(aligned_test_set, distance='TPOneHot', topk=topk),  mode='aligned')
 
     # Build t2i pseudo-aligned datasets (text -> top-k images)
     pseudo_aligned_train_set_t2i = EmbeddingDataset(
-        build_pseudo_aligned_dataset_t2i(unaligned_train_set, distance='PrivateHamming', topk=topk), mode='aligned')
+        build_pseudo_aligned_dataset_t2i(unaligned_train_set, distance='TPOneHot', topk=topk), mode='aligned')
     print('construct time (t2i):', time.time() - construct_time)
     construct_time = time.time()
     pseudo_aligned_test_set_t2i = EmbeddingDataset(
-        build_pseudo_aligned_dataset_t2i(aligned_test_set, distance='PrivateHamming', topk=topk),  mode='aligned')
+        build_pseudo_aligned_dataset_t2i(aligned_test_set, distance='TPOneHot', topk=topk),  mode='aligned')
 
     # Dataloaders
     train_loader_i2t = DataLoader(pseudo_aligned_train_set_i2t, batch_size=batch_size, shuffle=True)
@@ -359,7 +391,10 @@ if __name__ == '__main__':
     # ========== 选择训练模式 ==========
     # 可选值: 'i2t_only', 't2i_only', 'bidir'
     TRAINING_MODE = 'bidir'
-    # 训练日程：'bidir' 表示前半 i2t、后半 t2i；'i2t_full' 表示 60 个 epoch 全部 i2t
+    # 训练日程：
+    #   - 'bidir'    : 前半 i2t、后半 t2i
+    #   - 'i2t_full' : 全部 epoch 都用 i2t
+    #   - 't2i_full' : 全部 epoch 都用 t2i（你要做的 60 epoch 全 t2i 对比实验）
     TRAINING_SCHEDULE = 'bidir'  
     
     if TRAINING_MODE == 'i2t_only':
@@ -394,11 +429,22 @@ if __name__ == '__main__':
             # 全部 epoch 使用 i2t 方向
             train_loss = train_one_epoch(
                 model, train_loader_i2t, optimizer, criterion, device, mode='i2t')
+            phase = 'i2t-only'
+            phase_epoch = epoch
+        elif TRAINING_SCHEDULE == 't2i_full':
+            # 全部 epoch 使用 t2i 方向（60 epoch 全 t2i）
+            train_loss = train_one_epoch(
+                model, train_loader_t2i, optimizer, criterion, device, mode='t2i')
+            phase = 't2i-only'
+            phase_epoch = epoch
         else:
+            # bidir：前半 i2t，后半 t2i，并在切换时重置优化器
             if epoch < num_epochs // 2:
                 # 只训练 i2t 方向
                 train_loss = train_one_epoch(
                     model, train_loader_i2t, optimizer, criterion, device, mode='i2t')
+                phase = 'i2t-only'
+                phase_epoch = epoch
             else:
                 # 在方向切换的第一个 epoch，将优化器与 LR 重置到 1e-4
                 if epoch == num_epochs // 2:
@@ -406,16 +452,48 @@ if __name__ == '__main__':
                 # 只训练 t2i 方向
                 train_loss = train_one_epoch(
                     model, train_loader_t2i, optimizer, criterion, device, mode='t2i')
+                phase = 't2i-only'
+                phase_epoch = epoch - num_epochs // 2
 
-        # 每个 epoch 仅评估融合指标
-        metrics_fused = evaluate_retrieval_fused(model, test_loader_i2t, test_loader_t2i, device, alpha=0.5)
+        # 每个 epoch 仅评估融合指标，并按相似度矩阵类型分行打印，便于阅读
+        metrics_fused = evaluate_retrieval_fused(
+            model,
+            test_loader_i2t,
+            test_loader_t2i,
+            device,
+            img_fuse_weight=0.5,
+            txt_fuse_weight=0.5,
+            l2_normalize_fused=True,
+        )
 
-        phase = 'i2t-only' if (TRAINING_SCHEDULE == 'i2t_full' or epoch < num_epochs // 2) else 't2i-only'
-        print(
-            f"Epoch {epoch + 1} [{phase}] | Train Loss: {train_loss:.4f} | fused metrics: {metrics_fused}")
+        # 按前缀拆分三个相似度矩阵的指标
+        i2t_branch_metrics = {k: v for k, v in metrics_fused.items() if "_i2tBranch_" in k}
+        t2i_branch_metrics = {k: v for k, v in metrics_fused.items() if "_t2iBranch_" in k}
+        #fused_metrics_only = {k: v for k, v in metrics_fused.items() if "_fused_" in k}
+
+        # 计算两个分支在i2t和t2i方向的平均值
+        avg_metrics = {}
+        metric_names = ['R@1', 'R@5', 'R@10', 'MRR', 'mAP']
+        for metric_name in metric_names:
+            # i2t方向的平均值：(i2tBranch_i2t + t2iBranch_i2t) / 2
+            i2t_key_branch1 = f'{metric_name}_i2tBranch_i2t'
+            i2t_key_branch2 = f'{metric_name}_t2iBranch_i2t'
+            if i2t_key_branch1 in metrics_fused and i2t_key_branch2 in metrics_fused:
+                avg_metrics[f'{metric_name}_avg_i2t'] = (metrics_fused[i2t_key_branch1] + metrics_fused[i2t_key_branch2]) / 2
+            
+            # t2i方向的平均值：(i2tBranch_t2i + t2iBranch_t2i) / 2
+            t2i_key_branch1 = f'{metric_name}_i2tBranch_t2i'
+            t2i_key_branch2 = f'{metric_name}_t2iBranch_t2i'
+            if t2i_key_branch1 in metrics_fused and t2i_key_branch2 in metrics_fused:
+                avg_metrics[f'{metric_name}_avg_t2i'] = (metrics_fused[t2i_key_branch1] + metrics_fused[t2i_key_branch2]) / 2
+
+        print(f"Epoch {epoch + 1} [{phase}] | Train Loss: {train_loss:.4f}")
+        print(f"  i2tBranch metrics: {i2t_branch_metrics}")
+        print(f"  t2iBranch metrics: {t2i_branch_metrics}")
+        print(f"  Average metrics: {avg_metrics}")
+        #print(f"  fused(feat)  metrics: {fused_metrics_only}")
 
         # 阶段式 LR 衰减：每个阶段各自 0/10/20... 计数
-        phase_epoch = epoch if epoch < num_epochs // 2 else (epoch - num_epochs // 2)
         lr = 1e-4 * (0.1 ** (phase_epoch // 10))
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
@@ -454,5 +532,3 @@ if __name__ == '__main__':
 
 
     print('training time:', time.time() - training_begin)
-
-

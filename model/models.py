@@ -115,15 +115,24 @@ class ProjectionHead(nn.Module):
         # return F.normalize(self.net(x), dim=1)
 
 class CrossAttentionFusion(nn.Module):
-    def __init__(self, embed_dim=512, num_heads=8):
+    def __init__(self, embed_dim=512, num_heads=8, dropout=0.1):
         super().__init__()
+        # 候选集自注意力
+        self.self_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=dropout)
+        self.self_attn_norm = nn.LayerNorm(embed_dim)
+
         self.query_proj = nn.Linear(embed_dim, embed_dim)
         self.key_proj = nn.Linear(embed_dim, embed_dim)
         self.value_proj = nn.Linear(embed_dim, embed_dim)
-        self.multihead_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.multihead_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=dropout)
         self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, image_emb, topk_text_emb):
+        # 1. 候选集自注意力强化
+        topk_text_enhanced, _ = self.self_attn(topk_text_emb, topk_text_emb, topk_text_emb)
+        topk_text_emb = self.self_attn_norm(topk_text_emb + topk_text_enhanced)
+
+        # 2. 交叉注意力融合
         query = self.query_proj(image_emb).unsqueeze(1)   # (B, 1, D)
         key = self.key_proj(topk_text_emb)                # (B, K, D)
         value = self.value_proj(topk_text_emb)            # (B, K, D)
@@ -134,12 +143,16 @@ class CrossAttentionFusion(nn.Module):
 
 
 class BidirectionalCrossAttentionFusion(nn.Module):
-    def __init__(self, embed_dim=512, num_heads=8):
+    def __init__(self, embed_dim=512, num_heads=8, dropout=0.1):
         super().__init__()
+        # 候选集自注意力
+        self.self_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=dropout)
+        self.self_attn_norm = nn.LayerNorm(embed_dim)
+
         self.query_proj = nn.Linear(embed_dim, embed_dim)
         self.key_proj = nn.Linear(embed_dim, embed_dim)
         self.value_proj = nn.Linear(embed_dim, embed_dim)
-        self.multihead_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.multihead_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=dropout)
         self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, a_emb, b_emb, mode='i2t'):
@@ -151,6 +164,11 @@ class BidirectionalCrossAttentionFusion(nn.Module):
         if a_emb.dim() == 3:
             a_emb = a_emb.mean(dim=1)
 
+        # 1. 候选集自注意力强化
+        b_emb_enhanced, _ = self.self_attn(b_emb, b_emb, b_emb)
+        b_emb = self.self_attn_norm(b_emb + b_emb_enhanced)
+
+        # 2. 交叉注意力融合
         query = self.query_proj(a_emb).unsqueeze(1)    # (B, 1, D)
         key = self.key_proj(b_emb)                     # (B, K, D)
         value = self.value_proj(b_emb)                 # (B, K, D)
@@ -160,14 +178,24 @@ class BidirectionalCrossAttentionFusion(nn.Module):
 
 
 class PseudoAlignModel(nn.Module):
-    def __init__(self, embed_dim=512, num_heads=8):
+    def __init__(self, embed_dim=512, num_heads=8, share_proj_heads: bool = False):
         super().__init__()
-        self.fusion = CrossAttentionFusion(embed_dim, num_heads)
-        # 为两个方向分别使用独立的 cross-attention 头（不共享参数）
+        # 为两个方向分别使用独立的 cross-attention 头
         self.i2t_fusion = BidirectionalCrossAttentionFusion(embed_dim, num_heads)  # image -> text
         self.t2i_fusion = BidirectionalCrossAttentionFusion(embed_dim, num_heads)  # text -> image
-        self.img_proj = ProjectionHead(embed_dim, embed_dim, embed_dim)
-        self.txt_proj = ProjectionHead(embed_dim, embed_dim, embed_dim)
+
+        # 投影头：
+        # - 默认（share_proj_heads=False）：两个方向各自一套投影头，适合“先 i2t 再 t2i”的阶段训练，避免遗忘。
+        # - 共享（share_proj_heads=True）：两个方向共用一套投影头，参数更少，但阶段训练时可能互相干扰/遗忘。
+        self.share_proj_heads = share_proj_heads
+        if self.share_proj_heads:
+            self.img_proj_shared = ProjectionHead(embed_dim, embed_dim, embed_dim)
+            self.txt_proj_shared = ProjectionHead(embed_dim, embed_dim, embed_dim)
+        else:
+            self.img_proj_i2t = ProjectionHead(embed_dim, embed_dim, embed_dim)
+            self.txt_proj_i2t = ProjectionHead(embed_dim, embed_dim, embed_dim)
+            self.img_proj_t2i = ProjectionHead(embed_dim, embed_dim, embed_dim)
+            self.txt_proj_t2i = ProjectionHead(embed_dim, embed_dim, embed_dim)
 
     def forward(self, image_emb, text_or_topk_emb, mode='i2t'):
         """
@@ -181,13 +209,21 @@ class PseudoAlignModel(nn.Module):
         """
         if mode == 'i2t':
             fused_txt = self.i2t_fusion(image_emb, text_or_topk_emb, mode='i2t')
-            img_out = self.img_proj(image_emb)
-            txt_out = self.txt_proj(fused_txt)
+            if self.share_proj_heads:
+                img_out = self.img_proj_shared(image_emb)
+                txt_out = self.txt_proj_shared(fused_txt)
+            else:
+                img_out = self.img_proj_i2t(image_emb)
+                txt_out = self.txt_proj_i2t(fused_txt)
         elif mode == 't2i':
             # 将文本作为 a_emb，top-k 图像作为 b_emb
             fused_img = self.t2i_fusion(text_or_topk_emb, image_emb, mode='t2i')
-            img_out = self.img_proj(fused_img)
-            txt_out = self.txt_proj(text_or_topk_emb)
+            if self.share_proj_heads:
+                img_out = self.img_proj_shared(fused_img)
+                txt_out = self.txt_proj_shared(text_or_topk_emb)
+            else:
+                img_out = self.img_proj_t2i(fused_img)
+                txt_out = self.txt_proj_t2i(text_or_topk_emb)
         else:
             raise ValueError(f"Unsupported mode: {mode}")
 
@@ -404,4 +440,3 @@ class ContrastiveLoss(nn.Module):
             cost_im = cost_im.max(0)[0]
 
         return cost_s.sum() + cost_im.sum()
-

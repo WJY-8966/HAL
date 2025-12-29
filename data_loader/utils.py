@@ -19,7 +19,7 @@ from trainer.PrivateHamming import (encode_matrix, bit_flip_matrix, corrected_ha
 from trainer.OrthogonalProjection import (generate_orthogonal_lsh_projections,estimate_shift,
                                           lsh_hash_bits, normalize_embeddings, generate_random_lsh_vectors,
                                           generate_lsh_embeddings)
-
+from trainer.TPOneHot import (generate_tpoh_hashes,encode_tpoh_torch,compute_hamming_distance_chunked)
 
 @torch.no_grad()
 def save_MSCOCO_imagebind_embeddings(dataset, encoder, save_path, device='cuda:6', batch_size=512, collate_fn=None):
@@ -287,8 +287,16 @@ def build_pseudo_aligned_IEMOCAP(unaligned_data, topk=5, distance='Euclidean', d
         text_topk_indices_list = compute_private_hamming_topk_indices(
             img_embeddings=video_embeddings, txt_embeddings=txt_embeddings, k=topk,
             chunk_size=2048, epsilon=epsilon, r=10, seed=42)
-        audio_topk_indices_list = compute_private_hamming_topk_indices(img_embeddings=video_embeddings,txt_embeddings=audio_embeddings,
-                                                                       k=topk,chunk_size=2048, epsilon=epsilon, r=10, seed=42)
+        audio_topk_indices_list = compute_private_hamming_topk_indices(
+            img_embeddings=video_embeddings, txt_embeddings=audio_embeddings,
+            k=topk, chunk_size=2048, epsilon=epsilon, r=10, seed=42)
+    elif distance == 'TPOneHot':
+        text_topk_indices_list = compute_TPOneHot_topk_indices(
+            img_embeddings=video_embeddings, txt_embeddings=txt_embeddings, k=topk,
+            chunk_size=2048, epsilon=epsilon, seed=42, orthogonal=True)
+        audio_topk_indices_list = compute_TPOneHot_topk_indices(
+            img_embeddings=video_embeddings, txt_embeddings=audio_embeddings, k=topk,
+            chunk_size=2048, epsilon=epsilon, seed=42, orthogonal=True)
     else:
         raise ValueError(f"Unsupported distance metric: {distance}")
     # construct new dataset
@@ -309,7 +317,7 @@ def build_pseudo_aligned_IEMOCAP(unaligned_data, topk=5, distance='Euclidean', d
 
 
 
-def build_pseudo_aligned_dataset(unaligned_data, topk=5, distance='Euclidean', device='cuda:1', epsilon = 0.1):
+def build_pseudo_aligned_dataset(unaligned_data, topk=5, distance='Euclidean', device='cuda', epsilon = 0.1):
     """
     identify top-k most similar text embeddings for each image embedding
     unaligned_data: list of dicts with 'image_embedding' and 'text_embedding'
@@ -330,6 +338,10 @@ def build_pseudo_aligned_dataset(unaligned_data, topk=5, distance='Euclidean', d
         topk_indices_list = compute_bit_flipping_topk_indices(
             img_embeddings=img_embeddings, txt_embeddings=txt_embeddings, k=topk,
             chunk_size=2048, epsilon=epsilon, orthogonal=True)
+    elif distance == 'TPOneHot':
+        topk_indices_list = compute_TPOneHot_topk_indices(
+            img_embeddings=img_embeddings, txt_embeddings=txt_embeddings, k=topk,
+            chunk_size=2048, epsilon=epsilon, seed=42, orthogonal=True)
     else:
         raise ValueError(f"Unsupported distance metric: {distance}")
     # construct new dataset
@@ -349,7 +361,7 @@ def build_pseudo_aligned_dataset(unaligned_data, topk=5, distance='Euclidean', d
 
 
 
-def build_pseudo_aligned_dataset_t2i(unaligned_data, topk=5, distance='Euclidean', device='cuda:1', epsilon=0.1):
+def build_pseudo_aligned_dataset_t2i(unaligned_data, topk=5, distance='Euclidean', device='cuda', epsilon=0.1):
     """
     identify top-k most similar image embeddings for each text embedding (text->image)
     unaligned_data: list of dicts with 'image_embedding' and 'text_embedding'
@@ -370,6 +382,10 @@ def build_pseudo_aligned_dataset_t2i(unaligned_data, topk=5, distance='Euclidean
         topk_indices_list = compute_bit_flipping_topk_indices(
             img_embeddings=txt_embeddings, txt_embeddings=img_embeddings, k=topk,
             chunk_size=2048, epsilon=epsilon, orthogonal=True)
+    elif distance == 'TPOneHot':
+        topk_indices_list = compute_TPOneHot_topk_indices(
+            img_embeddings=txt_embeddings, txt_embeddings=img_embeddings, k=topk,
+            chunk_size=2048, epsilon=epsilon, seed=42, orthogonal=True)
     else:
         raise ValueError(f"Unsupported distance metric: {distance}")
 
@@ -410,6 +426,10 @@ def build_missing_pseudo_aligned_dataset(img_embeds, txt_embeds, topk=5,
         topk_indices_list = compute_bit_flipping_topk_indices(
             img_embeddings=img_embeddings, txt_embeddings=txt_embeddings, k=topk,
             chunk_size=2048, epsilon=epsilon, orthogonal=True)
+    elif distance == 'TPOneHot':
+        topk_indices_list = compute_TPOneHot_topk_indices(
+            img_embeddings=img_embeddings, txt_embeddings=txt_embeddings, k=topk,
+            chunk_size=2048, epsilon=epsilon, seed=42, orthogonal=True)
     else:
         raise ValueError(f"Unsupported distance metric: {distance}")
     # construct new dataset
@@ -555,9 +575,45 @@ def compute_bit_flipping_topk_indices(img_embeddings, txt_embeddings, k=5, chunk
 
     return topk_indices
 
+def compute_TPOneHot_topk_indices(img_embeddings, txt_embeddings, k=5, chunk_size=512, epsilon=0.1, seed=42, orthogonal=True):
+    img_embeddings = normalize_embeddings(img_embeddings)
+    txt_embeddings = normalize_embeddings(txt_embeddings)
+    shift = estimate_shift(img_embeddings, txt_embeddings)  # [D]
+    if orthogonal:
+        lsh_projections = generate_orthogonal_lsh_projections(shift, dim=img_embeddings.size(1), num_vecs=512)
+    else:
+        lsh_projections = generate_random_lsh_vectors(dim=img_embeddings.size(1), num_vecs=512)
+    img_bins = lsh_hash_bits(img_embeddings, lsh_projections)
+    txt_bins = lsh_hash_bits(txt_embeddings, lsh_projections)
+    # initialize
+
+    # # Encode image and text binary vectors
+    H0, H1, m = generate_tpoh_hashes(n=img_bins.size(1))
+    img_encoded = encode_tpoh_torch(img_bins, H0, H1, m)
+    txt_encoded = encode_tpoh_torch(txt_bins, H0, H1, m)
+
+    img_flipped = bit_flip_matrix_torch(img_encoded,epsilon)
+    txt_flipped = bit_flip_matrix_torch(txt_encoded,epsilon)
+
+    print(img_flipped.shape)
+
+    N_img = img_flipped.shape[0]
+    topk_indices = []
+
+    for start in tqdm(range(0, N_img, chunk_size), desc='Computing top-k indices'):
+        end= min(start + chunk_size, N_img)
+        img_chunk = img_flipped[start:end]
+        raw = compute_hamming_distance_chunked(img_chunk, txt_flipped)
+        # topk-k
+        _, topk_indices_chunk = torch.topk(-raw, k=k, dim=1)
+        topk_indices_chunk = topk_indices_chunk.cpu().tolist()
+        topk_indices.extend(topk_indices_chunk)
+
+    return topk_indices
+
 def compute_bidirectional_mappings(img_embeddings, txt_embeddings,
                                    topk_text=5, topk_image=5,
-                                   distance='PrivateHamming', device='cuda:0', **kwargs):
+                                   distance='PrivateHamming', device='cuda', **kwargs):
     """
     返回两个 list-of-lists：
       - topk_texts_per_image: length N_img, each is list of topk_text indices (K_t)
@@ -568,6 +624,9 @@ def compute_bidirectional_mappings(img_embeddings, txt_embeddings,
     if distance == 'PrivateHamming':
         topk_texts_per_image = compute_private_hamming_topk_indices(
             img_embeddings, txt_embeddings, k=topk_text, **kwargs)
+    elif distance == 'TPOneHot':
+        topk_texts_per_image = compute_TPOneHot_topk_indices(
+            img_embeddings, txt_embeddings, k=topk_text, **kwargs)
     else:
         # fallback to Euclidean
         topk_texts_per_image = compute_topk_Euclidean_indices(img_embeddings, txt_embeddings, topk=topk_text)
@@ -575,6 +634,9 @@ def compute_bidirectional_mappings(img_embeddings, txt_embeddings,
     # 2) text -> image (swap queries and candidates)
     if distance == 'PrivateHamming':
         topk_images_per_text = compute_private_hamming_topk_indices(
+            txt_embeddings, img_embeddings, k=topk_image, **kwargs)
+    elif distance == 'TPOneHot':
+        topk_images_per_text = compute_TPOneHot_topk_indices(
             txt_embeddings, img_embeddings, k=topk_image, **kwargs)
     else:
         topk_images_per_text = compute_topk_Euclidean_indices(txt_embeddings, img_embeddings, topk=topk_image)
