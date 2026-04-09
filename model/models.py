@@ -440,3 +440,67 @@ class ContrastiveLoss(nn.Module):
             cost_im = cost_im.max(0)[0]
 
         return cost_s.sum() + cost_im.sum()
+
+
+class RCMLoss(nn.Module):
+    """
+    Robust Cross-Correlation Mining Loss.
+
+    Implements the Lm loss proposed for semi-paired cross-modal learning:
+
+        p_i_i2t = exp(S_ii / tau) / sum_j exp(S_ij / tau)   (row softmax)
+        p_i_t2i = exp(S_ii / tau) / sum_j exp(S_ji / tau)   (col softmax)
+        L_rcm   = 1/2 * mean_i [(1 - p_i_i2t) + (1 - p_i_t2i)]
+
+    Key difference from standard InfoNCE / ContrastiveLoss:
+      - Uses (1 - p) instead of -log(p).  Because 1-p is bounded in [0, 1],
+        a single noisy pseudo pair can contribute at most 1.0 to the loss,
+        whereas -log(p) is unbounded.  This makes training more robust when
+        the pseudo-aligned data contains noisy correspondences.
+      - Naturally bidirectional: both i2t and t2i directions are averaged,
+        so the model is jointly optimized for both retrieval directions.
+
+    Optional `pair_weights` [B]: per-sample confidence scores from the
+    bidirectional retrieval stage (e.g. product of forward and backward
+    softmax probabilities).  Higher-confidence pseudo pairs contribute more
+    to the gradient, while uncertain pairs are down-weighted automatically.
+    """
+
+    def __init__(self, tau: float = 0.07):
+        super().__init__()
+        self.tau = tau
+
+    def forward(
+        self,
+        im: torch.Tensor,
+        s: torch.Tensor,
+        pair_weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            im: [B, D] L2-normalised image features.
+            s:  [B, D] L2-normalised text features.
+            pair_weights: optional [B] confidence weights per pseudo pair.
+                          Values need not sum to 1; they are re-normalised
+                          internally so that the effective batch size stays
+                          constant.
+        Returns:
+            Scalar loss.
+        """
+        scores = im @ s.t() / self.tau          # [B, B]
+
+        # Row-wise softmax → p_i2t: prob that each image matches its diagonal text
+        p_i2t = F.softmax(scores, dim=1).diagonal()   # [B]
+        # Col-wise softmax → p_t2i: prob that each text matches its diagonal image
+        p_t2i = F.softmax(scores, dim=0).diagonal()   # [B]
+
+        # Per-pair loss: average of the two 1-p terms (eq. 8 in paper)
+        per_pair = ((1.0 - p_i2t) + (1.0 - p_t2i)) * 0.5   # [B], in [0, 1]
+
+        if pair_weights is not None:
+            w = pair_weights.to(im.device).float().clamp(min=0.0)
+            # Re-normalise so that mean weight == 1 (preserves loss scale)
+            w = w / w.mean().clamp(min=1e-8)
+            return (per_pair * w).mean()
+
+        return per_pair.mean()

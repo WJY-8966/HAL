@@ -6,9 +6,13 @@ import random
 import time
 from data_loader.MSCOCODataset import EmbeddingDataset, embedding_collate_fn
 from torch.utils.data import  DataLoader
-from data_loader.utils import build_pseudo_aligned_dataset, build_pseudo_aligned_dataset_t2i
+from data_loader.utils import (
+    build_pseudo_aligned_dataset,
+    build_pseudo_aligned_dataset_t2i,
+    build_bidirectional_pseudo_aligned_datasets_hashcoreset_reciprocal,
+)
 from utils.utils import seed_torch
-from model.models import ClipLinear, ContrastiveLoss, PseudoAlignModel, T2IOnlyModel, I2TOnlyModel
+from model.models import ClipLinear, ContrastiveLoss, RCMLoss, PseudoAlignModel, T2IOnlyModel, I2TOnlyModel
 
 
 
@@ -343,6 +347,19 @@ if __name__ == '__main__':
     num_epochs = 60
     batch_size = 512
     topk = 5
+    # After TPOneHot retrieval, apply hash-bucketing coreset + vote-topk (ARROW-style)
+    distance = 'HashCoreset'  # 'TPOneHot' (baseline) or 'HashCoreset' (TPOneHot + coreset)
+    coreset_ratio = 0.8
+    coreset_max_prefix_len = 20
+    coreset_seed = 0
+    hashcoreset_diagnostics = False
+    # Set to False to skip reciprocal rerank and pass raw TPOneHot top-k directly
+    # into HashCoreset.  The rerank code is preserved and can be re-enabled here.
+    use_reciprocal_rerank = False
+    # Loss function: 'rcm' or 'contrastive'
+    #   'rcm'        : RCMLoss  — bounded [0,1], robust to noisy pseudo pairs
+    #   'contrastive': ContrastiveLoss — hard-margin triplet, max_violation=True
+    loss_type = 'contrastive'
     data = torch.load(pretrained_file)
     print("data length:", len(data))
     seed_torch()
@@ -360,21 +377,105 @@ if __name__ == '__main__':
 
     # construct pseudo aligned dataset
     construct_time = time.time()
-    # Build i2t pseudo-aligned datasets (image -> top-k texts)
-    pseudo_aligned_train_set_i2t = EmbeddingDataset(
-        build_pseudo_aligned_dataset(unaligned_train_set, distance='TPOneHot', topk=topk), mode='aligned')
-    print('construct time (i2t):', time.time() - construct_time)
-    construct_time = time.time()
-    pseudo_aligned_test_set_i2t = EmbeddingDataset(
-        build_pseudo_aligned_dataset(aligned_test_set, distance='TPOneHot', topk=topk),  mode='aligned')
+    prune_train_to_coreset = (distance == 'HashCoreset')
+    if prune_train_to_coreset:
+        print(f"Enable representative-only training set pruning for `{distance}`.")
 
-    # Build t2i pseudo-aligned datasets (text -> top-k images)
-    pseudo_aligned_train_set_t2i = EmbeddingDataset(
-        build_pseudo_aligned_dataset_t2i(unaligned_train_set, distance='TPOneHot', topk=topk), mode='aligned')
-    print('construct time (t2i):', time.time() - construct_time)
-    construct_time = time.time()
-    pseudo_aligned_test_set_t2i = EmbeddingDataset(
-        build_pseudo_aligned_dataset_t2i(aligned_test_set, distance='TPOneHot', topk=topk),  mode='aligned')
+    if distance == 'HashCoreset':
+        train_i2t_data, train_t2i_data = build_bidirectional_pseudo_aligned_datasets_hashcoreset_reciprocal(
+            unaligned_train_set,
+            topk=topk,
+            device=str(device),
+            coreset_ratio=coreset_ratio,
+            coreset_max_prefix_len=coreset_max_prefix_len,
+            coreset_seed=coreset_seed,
+            prune_to_coreset_reps=prune_train_to_coreset,
+            hashcoreset_diagnostics=hashcoreset_diagnostics,
+            use_reciprocal_rerank=use_reciprocal_rerank,
+        )
+        pseudo_aligned_train_set_i2t = EmbeddingDataset(train_i2t_data, mode='aligned')
+        pseudo_aligned_train_set_t2i = EmbeddingDataset(train_t2i_data, mode='aligned')
+        print('construct time (train bidir):', time.time() - construct_time)
+        print(f"train queries kept (i2t): {len(pseudo_aligned_train_set_i2t)}/{len(unaligned_train_set)}")
+        print(f"train queries kept (t2i): {len(pseudo_aligned_train_set_t2i)}/{len(unaligned_train_set)}")
+
+        construct_time = time.time()
+        test_i2t_data, test_t2i_data = build_bidirectional_pseudo_aligned_datasets_hashcoreset_reciprocal(
+            aligned_test_set,
+            topk=topk,
+            device=str(device),
+            coreset_ratio=coreset_ratio,
+            coreset_max_prefix_len=coreset_max_prefix_len,
+            coreset_seed=coreset_seed,
+            prune_to_coreset_reps=prune_train_to_coreset,
+            hashcoreset_diagnostics=hashcoreset_diagnostics,
+            use_reciprocal_rerank=use_reciprocal_rerank,
+        )
+        pseudo_aligned_test_set_i2t = EmbeddingDataset(test_i2t_data, mode='aligned')
+        pseudo_aligned_test_set_t2i = EmbeddingDataset(test_t2i_data, mode='aligned')
+        print('construct time (test bidir):', time.time() - construct_time)
+    else:
+        pseudo_aligned_train_set_i2t = EmbeddingDataset(
+            build_pseudo_aligned_dataset(
+                unaligned_train_set,
+                distance=distance,
+                topk=topk,
+                device=str(device),
+                coreset_ratio=coreset_ratio,
+                coreset_max_prefix_len=coreset_max_prefix_len,
+                coreset_seed=coreset_seed,
+                prune_to_coreset_reps=prune_train_to_coreset,
+                hashcoreset_diagnostics=hashcoreset_diagnostics,
+            ),
+            mode='aligned')
+        print('construct time (i2t):', time.time() - construct_time)
+        print(f"train queries kept (i2t): {len(pseudo_aligned_train_set_i2t)}/{len(unaligned_train_set)}")
+
+        construct_time = time.time()
+        pseudo_aligned_test_set_i2t = EmbeddingDataset(
+            build_pseudo_aligned_dataset(
+                aligned_test_set,
+                distance=distance,
+                topk=topk,
+                device=str(device),
+                coreset_ratio=coreset_ratio,
+                coreset_max_prefix_len=coreset_max_prefix_len,
+                coreset_seed=coreset_seed,
+                prune_to_coreset_reps=prune_train_to_coreset,
+                hashcoreset_diagnostics=hashcoreset_diagnostics,
+            ),
+            mode='aligned')
+
+        pseudo_aligned_train_set_t2i = EmbeddingDataset(
+            build_pseudo_aligned_dataset_t2i(
+                unaligned_train_set,
+                distance=distance,
+                topk=topk,
+                device=str(device),
+                coreset_ratio=coreset_ratio,
+                coreset_max_prefix_len=coreset_max_prefix_len,
+                coreset_seed=coreset_seed,
+                prune_to_coreset_reps=prune_train_to_coreset,
+                hashcoreset_diagnostics=hashcoreset_diagnostics,
+            ),
+            mode='aligned')
+        print('construct time (t2i):', time.time() - construct_time)
+        print(f"train queries kept (t2i): {len(pseudo_aligned_train_set_t2i)}/{len(unaligned_train_set)}")
+
+        construct_time = time.time()
+        pseudo_aligned_test_set_t2i = EmbeddingDataset(
+            build_pseudo_aligned_dataset_t2i(
+                aligned_test_set,
+                distance=distance,
+                topk=topk,
+                device=str(device),
+                coreset_ratio=coreset_ratio,
+                coreset_max_prefix_len=coreset_max_prefix_len,
+                coreset_seed=coreset_seed,
+                prune_to_coreset_reps=prune_train_to_coreset,
+                hashcoreset_diagnostics=hashcoreset_diagnostics,
+            ),
+            mode='aligned')
 
     # Dataloaders
     train_loader_i2t = DataLoader(pseudo_aligned_train_set_i2t, batch_size=batch_size, shuffle=True)
@@ -385,8 +486,13 @@ if __name__ == '__main__':
     pseudo_aligned_model = PseudoAlignModel(embed_dim=512).to(device)
 
     pseudo_aligned_optimizer = torch.optim.Adam(pseudo_aligned_model.parameters(), lr=1e-4)
-    pseudo_aligned_criterion = ContrastiveLoss(margin=0.2, measure='cosine', max_violation=True)
-    pseudo_aligned_criterion.to(device)
+
+    def _make_criterion():
+        if loss_type == 'contrastive':
+            return ContrastiveLoss(margin=0.2, measure='cosine', max_violation=True).to(device)
+        return RCMLoss(tau=0.07).to(device)
+
+    pseudo_aligned_criterion = _make_criterion()
 
     # ========== 选择训练模式 ==========
     # 可选值: 'i2t_only', 't2i_only', 'bidir'
@@ -395,24 +501,22 @@ if __name__ == '__main__':
     #   - 'bidir'    : 前半 i2t、后半 t2i
     #   - 'i2t_full' : 全部 epoch 都用 i2t
     #   - 't2i_full' : 全部 epoch 都用 t2i（你要做的 60 epoch 全 t2i 对比实验）
-    TRAINING_SCHEDULE = 'bidir'  
-    
+    TRAINING_SCHEDULE = 'bidir'
+
     if TRAINING_MODE == 'i2t_only':
         print("=" * 60)
         print("Training mode: I2T-ONLY (image as query, top-k texts as key/value)")
         print("=" * 60)
         model = I2TOnlyModel(embed_dim=512).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-        criterion = ContrastiveLoss(margin=0.2, measure='cosine', max_violation=True)
-        criterion.to(device)
+        criterion = _make_criterion()
     elif TRAINING_MODE == 't2i_only':
         print("=" * 60)
         print("Training mode: T2I-ONLY (text as query, top-k images as key/value)")
         print("=" * 60)
         model = T2IOnlyModel(embed_dim=512).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-        criterion = ContrastiveLoss(margin=0.2, measure='cosine', max_violation=True)
-        criterion.to(device)
+        criterion = _make_criterion()
     else:  # bidir
         print("=" * 60)
         print("Training mode: BIDIRECTIONAL (both i2t and t2i)")
@@ -422,9 +526,11 @@ if __name__ == '__main__':
         criterion = pseudo_aligned_criterion
         t2i_weight = 2.0
 
-    training_begin = time.time()
+    train_time_total = 0.0
+    train_eval_total_begin = time.time()
 
     for epoch in range(num_epochs):
+        epoch_train_begin = time.time()
         if TRAINING_SCHEDULE == 'i2t_full':
             # 全部 epoch 使用 i2t 方向
             train_loss = train_one_epoch(
@@ -454,6 +560,7 @@ if __name__ == '__main__':
                     model, train_loader_t2i, optimizer, criterion, device, mode='t2i')
                 phase = 't2i-only'
                 phase_epoch = epoch - num_epochs // 2
+        train_time_total += time.time() - epoch_train_begin
 
         # 每个 epoch 仅评估融合指标，并按相似度矩阵类型分行打印，便于阅读
         metrics_fused = evaluate_retrieval_fused(
@@ -531,4 +638,5 @@ if __name__ == '__main__':
     #             f"Epoch {epoch + 1} [bidir] | Train Loss: {train_loss:.4f} | i2t: {metrics_i2t} | t2i: {metrics_t2i}")
 
 
-    print('training time:', time.time() - training_begin)
+    print('training time (train only):', train_time_total)
+    print('training time (train + eval total):', time.time() - train_eval_total_begin)

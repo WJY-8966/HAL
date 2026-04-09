@@ -12,7 +12,11 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import torch.nn.functional as F
 import json
-from imagebind.models.imagebind_model import ModalityType
+try:
+    from imagebind.models.imagebind_model import ModalityType
+except ModuleNotFoundError:
+    # imagebind is only needed for embedding export helpers; core training code does not depend on it
+    ModalityType = None
 from trainer.PrivateHamming import (encode_matrix, bit_flip_matrix, corrected_hamming_matrix, generate_disjoint_hashes,
                                     encode_matrix_torch,encode_matrix_chunked, bit_flip_matrix_torch,
                                     corrected_hamming_matrix_torch, corrected_hamming_distance_chunked)
@@ -20,6 +24,346 @@ from trainer.OrthogonalProjection import (generate_orthogonal_lsh_projections,es
                                           lsh_hash_bits, normalize_embeddings, generate_random_lsh_vectors,
                                           generate_lsh_embeddings)
 from trainer.TPOneHot import (generate_tpoh_hashes,encode_tpoh_torch,compute_hamming_distance_chunked)
+from trainer.Coreset import apply_coreset_after_topk
+
+
+def print_hashcoreset_diagnostics(tag, diagnostics):
+    print(
+        f"[HashCoreset {tag} diagnostics] "
+        f"queries={diagnostics['num_queries']} reps={diagnostics['num_reps']} "
+        f"compression={diagnostics['compression_ratio']:.3f} nonrep={diagnostics['nonrep_ratio']:.3f}"
+    )
+    print(
+        f"[HashCoreset {tag} diagnostics] "
+        f"buckets={diagnostics['num_buckets']} "
+        f"bucket_size(mean/median/p90/max)="
+        f"{diagnostics['bucket_size_mean']:.2f}/"
+        f"{diagnostics['bucket_size_median']:.2f}/"
+        f"{diagnostics['bucket_size_p90']:.2f}/"
+        f"{diagnostics['bucket_size_max']:.0f}"
+    )
+    print(
+        f"[HashCoreset {tag} diagnostics] "
+        f"gt_top1(before->after)={diagnostics['orig_top1_is_gt_rate']:.4f}->"
+        f"{diagnostics['new_top1_is_gt_rate']:.4f}, "
+        f"gt_in_topk(before->after)={diagnostics['gt_in_orig_topk_rate']:.4f}->"
+        f"{diagnostics['gt_in_new_topk_rate']:.4f}"
+    )
+    print(
+        f"[HashCoreset {tag} diagnostics] "
+        f"top1_preserved={diagnostics['top1_preserved_rate']:.4f}, "
+        f"orig_top1_kept_in_new_topk={diagnostics['orig_top1_kept_in_new_topk_rate']:.4f}, "
+        f"top1_agrees_with_rep={diagnostics['query_top1_agrees_with_rep_rate']:.4f}, "
+        f"unique_new_top1_ratio={diagnostics['unique_new_top1_ratio']:.4f}"
+    )
+
+
+def reciprocal_rerank_topk(
+    forward_topk,
+    backward_topk,
+    *,
+    forward_topk_distances=None,
+    backward_topk_distances=None,
+    topk_out=None,
+    incoming_cap=None,
+    row_weight=1.0,
+    reciprocal_weight=1.0,
+    col_weight=1.0,
+    top1_weight=0.3,
+    forward_distance_weight=1.0,
+    backward_distance_weight=1.0,
+    distance_tau=8.0,
+    tag="i2t",
+):
+    """
+    Reciprocal rerank on a bipartite top-k graph.
+
+    `forward_topk` is the candidate list we want to rerank. `backward_topk`
+    provides reciprocal evidence from the opposite retrieval direction.
+
+    When distance tables are provided, the distance scoring follows the
+    bidirectional matching probability idea from cross-modal learning:
+
+        p_fwd(q, c) = exp(-d_fwd(q,c) / tau) / sum_k exp(-d_fwd(q,k) / tau)
+        p_bwd(c, q) = exp(-d_bwd(c,q) / tau) / sum_k exp(-d_bwd(c,k) / tau)
+
+    These softmax probabilities are more principled than rank-based or
+    linear-normalized scores: they are locally comparable within each query's
+    candidate set and reflect actual distance magnitudes.
+
+    `distance_tau` controls the temperature of the softmax.  A smaller tau
+    sharpens the distribution (first-ranked dominates); a larger tau flattens
+    it (ranks matter less than reciprocal evidence).
+    """
+    def _softmax_distance_scores(distance_map, tau):
+        """Convert a {idx: hamming_distance} map to softmax probability scores.
+        Lower distance → higher probability score."""
+        if not distance_map:
+            return {}
+        indices = list(distance_map.keys())
+        dists = torch.tensor([float(distance_map[i]) for i in indices], dtype=torch.float32)
+        probs = torch.softmax(-dists / max(float(tau), 1e-6), dim=0)
+        return {idx: float(p) for idx, p in zip(indices, probs)}
+
+    if topk_out is None:
+        topk_out = len(forward_topk[0]) if forward_topk else 0
+    if incoming_cap is None:
+        incoming_cap = topk_out
+
+    num_queries = len(forward_topk)
+    backward_rank_maps = []
+    backward_distance_maps = []
+    incoming_candidates = [[] for _ in range(num_queries)]
+
+    for other_idx, row in enumerate(backward_topk):
+        rank_map = {}
+        dist_map = {}
+        row_distances = (
+            backward_topk_distances[other_idx]
+            if backward_topk_distances is not None and other_idx < len(backward_topk_distances)
+            else None
+        )
+        for rank, query_idx in enumerate(row):
+            query_idx = int(query_idx)
+            if query_idx < 0 or query_idx in rank_map:
+                continue
+            rank_map[query_idx] = rank
+            if row_distances is not None and rank < len(row_distances):
+                dist_map[query_idx] = float(row_distances[rank])
+            if 0 <= query_idx < num_queries:
+                incoming_candidates[query_idx].append((other_idx, rank))
+        backward_rank_maps.append(rank_map)
+        backward_distance_maps.append(_softmax_distance_scores(dist_map, distance_tau))
+
+    reranked = []
+    total_candidate_pool = 0
+    total_added_candidates = 0
+    total_reciprocal_final = 0
+
+    for query_idx, row in enumerate(forward_topk):
+        forward_rank = {}
+        forward_distance_map = {}
+        candidate_pool = []
+        row_distances = (
+            forward_topk_distances[query_idx]
+            if forward_topk_distances is not None and query_idx < len(forward_topk_distances)
+            else None
+        )
+        for rank, candidate_idx in enumerate(row):
+            candidate_idx = int(candidate_idx)
+            if candidate_idx < 0 or candidate_idx in forward_rank:
+                continue
+            forward_rank[candidate_idx] = rank
+            if row_distances is not None and rank < len(row_distances):
+                forward_distance_map[candidate_idx] = float(row_distances[rank])
+            candidate_pool.append(candidate_idx)
+        forward_distance_scores = _softmax_distance_scores(forward_distance_map, distance_tau)
+
+        extras = sorted(incoming_candidates[query_idx], key=lambda item: item[1])
+        if incoming_cap is not None:
+            extras = extras[:incoming_cap]
+        for candidate_idx, _ in extras:
+            if candidate_idx not in forward_rank:
+                candidate_pool.append(candidate_idx)
+                total_added_candidates += 1
+
+        total_candidate_pool += len(candidate_pool)
+
+        scored_candidates = []
+        for candidate_idx in candidate_pool:
+            row_rank = forward_rank.get(candidate_idx)
+            back_rank = None
+            row_distance_score = forward_distance_scores.get(candidate_idx, 0.0)
+            back_distance_score = 0.0
+            if 0 <= candidate_idx < len(backward_rank_maps):
+                back_rank = backward_rank_maps[candidate_idx].get(query_idx)
+                back_distance_score = backward_distance_maps[candidate_idx].get(query_idx, 0.0)
+
+            reciprocal_flag = back_rank is not None
+            row_score = 1.0 / (1.0 + row_rank) if row_rank is not None else 0.0
+            col_score = 1.0 / (1.0 + back_rank) if back_rank is not None else 0.0
+            top1_bonus = 1.0 if row_rank == 0 and back_rank == 0 else 0.0
+            score = (
+                row_weight * row_score
+                + reciprocal_weight * float(reciprocal_flag)
+                + col_weight * col_score
+                + top1_weight * top1_bonus
+                + forward_distance_weight * row_distance_score
+                + backward_distance_weight * back_distance_score
+            )
+            scored_candidates.append({
+                'candidate_idx': candidate_idx,
+                'score': score,
+                'row_rank': row_rank if row_rank is not None else 10 ** 9,
+                'back_rank': back_rank if back_rank is not None else 10 ** 9,
+            })
+
+        scored_candidates.sort(
+            key=lambda item: (
+                -item['score'],
+                item['row_rank'],
+                item['back_rank'],
+                item['candidate_idx'],
+            )
+        )
+        final_row = [item['candidate_idx'] for item in scored_candidates[:topk_out]]
+        total_reciprocal_final += sum(
+            1 for candidate_idx in final_row
+            if 0 <= candidate_idx < len(backward_rank_maps)
+            and query_idx in backward_rank_maps[candidate_idx]
+        )
+        reranked.append(final_row)
+
+    denom = max(num_queries, 1)
+    reciprocal_rate = total_reciprocal_final / float(max(num_queries * max(topk_out, 1), 1))
+    print(
+        f"[ReciprocalRerank {tag}] "
+        f"queries={num_queries} avg_candidate_pool={total_candidate_pool / denom:.2f} "
+        f"added_candidates={total_added_candidates} final_mutual_rate={reciprocal_rate:.4f}"
+    )
+    return reranked
+
+
+def _apply_hashcoreset_pipeline(
+    topk_indices_list,
+    query_bits,
+    *,
+    direction_tag,
+    coreset_ratio,
+    coreset_max_prefix_len,
+    coreset_seed,
+    prune_to_coreset_reps,
+    hashcoreset_diagnostics,
+):
+    result = apply_coreset_after_topk(
+        topk_indices_list,
+        query_bits,
+        topk_distances=None,
+        coreset_ratio=coreset_ratio,
+        max_prefix_len=coreset_max_prefix_len,
+        seed=coreset_seed,
+        return_diagnostics=hashcoreset_diagnostics,
+    )
+    if hashcoreset_diagnostics:
+        topk_indices_list, reps, assign, diagnostics = result
+        print_hashcoreset_diagnostics(direction_tag, diagnostics)
+    else:
+        topk_indices_list, reps, assign = result
+    selected_query_indices = reps.cpu().tolist() if prune_to_coreset_reps else None
+    print(
+        f"[HashCoreset {direction_tag}] coreset_ratio={coreset_ratio} "
+        f"reps={int(reps.numel())}/{int(assign.numel())} "
+        f"pruned_train_queries={len(selected_query_indices) if selected_query_indices is not None else len(topk_indices_list)}"
+    )
+    return topk_indices_list, selected_query_indices
+
+
+def build_bidirectional_pseudo_aligned_datasets_hashcoreset_reciprocal(
+    unaligned_data,
+    topk=5,
+    device='cuda',
+    epsilon=0.1,
+    *,
+    coreset_ratio=0.8,
+    coreset_max_prefix_len=20,
+    coreset_seed=0,
+    prune_to_coreset_reps=False,
+    hashcoreset_diagnostics=False,
+    reciprocal_incoming_cap=None,
+    use_reciprocal_rerank=True,
+):
+    """
+    Scheme A:
+      1. build bidirectional TPOneHot top-k lists
+      2. (optional) reciprocal rerank each direction with the opposite direction
+      3. apply HashCoreset on the reranked lists
+      4. materialize i2t / t2i pseudo-aligned datasets
+
+    Set `use_reciprocal_rerank=False` to skip step 2 and pass the raw top-k
+    lists directly into HashCoreset.  The reciprocal_rerank_topk code is kept
+    intact and can be re-enabled by flipping the flag back to True.
+    """
+    img_embeddings = torch.stack([d['image_embedding'] for d in unaligned_data]).to(device)
+    txt_embeddings = torch.stack([d['text_embedding'] for d in unaligned_data]).to(device)
+
+    i2t_topk_raw, t2i_topk_raw, i2t_query_bits, t2i_query_bits, i2t_topk_distances, t2i_topk_distances = compute_TPOneHot_bidirectional_topk_indices(
+        img_embeddings=img_embeddings,
+        txt_embeddings=txt_embeddings,
+        k=topk,
+        chunk_size=2048,
+        epsilon=epsilon,
+        seed=42,
+        orthogonal=True,
+        return_query_bins=True,
+        return_topk_distances=True,
+    )
+
+    if use_reciprocal_rerank:
+        i2t_topk_reranked = reciprocal_rerank_topk(
+            i2t_topk_raw,
+            t2i_topk_raw,
+            forward_topk_distances=i2t_topk_distances,
+            backward_topk_distances=t2i_topk_distances,
+            topk_out=topk,
+            incoming_cap=reciprocal_incoming_cap,
+            tag="i2t",
+        )
+        t2i_topk_reranked = reciprocal_rerank_topk(
+            t2i_topk_raw,
+            i2t_topk_raw,
+            forward_topk_distances=t2i_topk_distances,
+            backward_topk_distances=i2t_topk_distances,
+            topk_out=topk,
+            incoming_cap=reciprocal_incoming_cap,
+            tag="t2i",
+        )
+    else:
+        print("[ReciprocalRerank] skipped (use_reciprocal_rerank=False)")
+        i2t_topk_reranked = i2t_topk_raw
+        t2i_topk_reranked = t2i_topk_raw
+
+    i2t_topk_final, selected_i2t_indices = _apply_hashcoreset_pipeline(
+        i2t_topk_reranked,
+        i2t_query_bits,
+        direction_tag="i2t",
+        coreset_ratio=coreset_ratio,
+        coreset_max_prefix_len=coreset_max_prefix_len,
+        coreset_seed=coreset_seed,
+        prune_to_coreset_reps=prune_to_coreset_reps,
+        hashcoreset_diagnostics=hashcoreset_diagnostics,
+    )
+    t2i_topk_final, selected_t2i_indices = _apply_hashcoreset_pipeline(
+        t2i_topk_reranked,
+        t2i_query_bits,
+        direction_tag="t2i",
+        coreset_ratio=coreset_ratio,
+        coreset_max_prefix_len=coreset_max_prefix_len,
+        coreset_seed=coreset_seed,
+        prune_to_coreset_reps=prune_to_coreset_reps,
+        hashcoreset_diagnostics=hashcoreset_diagnostics,
+    )
+
+    dataset_i2t = []
+    query_indices_i2t = selected_i2t_indices if selected_i2t_indices is not None else range(len(i2t_topk_final))
+    for i in query_indices_i2t:
+        topk_indices = i2t_topk_final[i]
+        dataset_i2t.append({
+            'image_embedding': img_embeddings[i].cpu(),
+            'text_embedding': txt_embeddings[topk_indices].cpu(),
+            'category': unaligned_data[i]['category'] if 'category' in unaligned_data[i] else torch.tensor(-1),
+        })
+
+    dataset_t2i = []
+    query_indices_t2i = selected_t2i_indices if selected_t2i_indices is not None else range(len(t2i_topk_final))
+    for i in query_indices_t2i:
+        topk_indices = t2i_topk_final[i]
+        dataset_t2i.append({
+            'image_embedding': img_embeddings[topk_indices].cpu(),
+            'text_embedding': txt_embeddings[i].cpu(),
+            'category': unaligned_data[i]['category'] if 'category' in unaligned_data[i] else torch.tensor(-1),
+        })
+
+    return dataset_i2t, dataset_t2i
 
 @torch.no_grad()
 def save_MSCOCO_imagebind_embeddings(dataset, encoder, save_path, device='cuda:6', batch_size=512, collate_fn=None):
@@ -317,7 +661,19 @@ def build_pseudo_aligned_IEMOCAP(unaligned_data, topk=5, distance='Euclidean', d
 
 
 
-def build_pseudo_aligned_dataset(unaligned_data, topk=5, distance='Euclidean', device='cuda', epsilon = 0.1):
+def build_pseudo_aligned_dataset(
+    unaligned_data,
+    topk=5,
+    distance='Euclidean',
+    device='cuda',
+    epsilon=0.1,
+    *,
+    coreset_ratio: float = 0.8,
+    coreset_max_prefix_len: int = 20,
+    coreset_seed: int = 0,
+    prune_to_coreset_reps: bool = False,
+    hashcoreset_diagnostics: bool = False,
+):
     """
     identify top-k most similar text embeddings for each image embedding
     unaligned_data: list of dicts with 'image_embedding' and 'text_embedding'
@@ -326,6 +682,7 @@ def build_pseudo_aligned_dataset(unaligned_data, topk=5, distance='Euclidean', d
     img_embeddings = torch.stack([d['image_embedding'] for d in unaligned_data]).to(device)
     txt_embeddings = torch.stack([d['text_embedding'] for d in unaligned_data]).to(device)
     topk_indices_list = []
+    selected_query_indices = None
     if distance == 'Euclidean':
         topk_indices_list = compute_topk_Euclidean_indices(img_embeddings, txt_embeddings, topk=topk)
     elif distance == 'Hamming':
@@ -342,11 +699,39 @@ def build_pseudo_aligned_dataset(unaligned_data, topk=5, distance='Euclidean', d
         topk_indices_list = compute_TPOneHot_topk_indices(
             img_embeddings=img_embeddings, txt_embeddings=txt_embeddings, k=topk,
             chunk_size=2048, epsilon=epsilon, seed=42, orthogonal=True)
+    elif distance == 'HashCoreset':
+        topk_indices_list, query_bits, topk_distances = compute_TPOneHot_topk_indices(
+            img_embeddings=img_embeddings, txt_embeddings=txt_embeddings, k=topk,
+            chunk_size=2048, epsilon=epsilon, seed=42, orthogonal=True,
+            return_query_bins=True, return_topk_distances=True)
+        result = apply_coreset_after_topk(
+            topk_indices_list,
+            query_bits,
+            topk_distances=topk_distances,
+            coreset_ratio=coreset_ratio,
+            max_prefix_len=coreset_max_prefix_len,
+            seed=coreset_seed,
+            return_diagnostics=hashcoreset_diagnostics,
+        )
+        if hashcoreset_diagnostics:
+            topk_indices_list, reps, assign, diagnostics = result
+            print_hashcoreset_diagnostics("i2t", diagnostics)
+        else:
+            topk_indices_list, reps, assign = result
+        if prune_to_coreset_reps:
+            selected_query_indices = reps.cpu().tolist()
+        print(
+            f"[HashCoreset i2t] coreset_ratio={coreset_ratio} "
+            f"reps={int(reps.numel())}/{int(assign.numel())} "
+            f"pruned_train_queries={len(selected_query_indices) if selected_query_indices is not None else len(topk_indices_list)}"
+        )
     else:
         raise ValueError(f"Unsupported distance metric: {distance}")
     # construct new dataset
     new_dataset = []
-    for i, topk_indices in enumerate(topk_indices_list):
+    query_indices = selected_query_indices if selected_query_indices is not None else range(len(topk_indices_list))
+    for i in query_indices:
+        topk_indices = topk_indices_list[i]
         image_emb = img_embeddings[i]
         topk_txt_emb = txt_embeddings[topk_indices]  # [topk, D]
 
@@ -361,7 +746,19 @@ def build_pseudo_aligned_dataset(unaligned_data, topk=5, distance='Euclidean', d
 
 
 
-def build_pseudo_aligned_dataset_t2i(unaligned_data, topk=5, distance='Euclidean', device='cuda', epsilon=0.1):
+def build_pseudo_aligned_dataset_t2i(
+    unaligned_data,
+    topk=5,
+    distance='Euclidean',
+    device='cuda',
+    epsilon=0.1,
+    *,
+    coreset_ratio: float = 0.6,
+    coreset_max_prefix_len: int = 20,
+    coreset_seed: int = 0,
+    prune_to_coreset_reps: bool = False,
+    hashcoreset_diagnostics: bool = False,
+):
     """
     identify top-k most similar image embeddings for each text embedding (text->image)
     unaligned_data: list of dicts with 'image_embedding' and 'text_embedding'
@@ -370,6 +767,7 @@ def build_pseudo_aligned_dataset_t2i(unaligned_data, topk=5, distance='Euclidean
     img_embeddings = torch.stack([d['image_embedding'] for d in unaligned_data]).to(device)
     txt_embeddings = torch.stack([d['text_embedding'] for d in unaligned_data]).to(device)
 
+    selected_query_indices = None
     if distance == 'Euclidean':
         topk_indices_list = compute_topk_Euclidean_indices(txt_embeddings, img_embeddings, topk=topk)
     elif distance == 'Hamming':
@@ -386,11 +784,39 @@ def build_pseudo_aligned_dataset_t2i(unaligned_data, topk=5, distance='Euclidean
         topk_indices_list = compute_TPOneHot_topk_indices(
             img_embeddings=txt_embeddings, txt_embeddings=img_embeddings, k=topk,
             chunk_size=2048, epsilon=epsilon, seed=42, orthogonal=True)
+    elif distance == 'HashCoreset':
+        topk_indices_list, query_bits, topk_distances = compute_TPOneHot_topk_indices(
+            img_embeddings=txt_embeddings, txt_embeddings=img_embeddings, k=topk,
+            chunk_size=2048, epsilon=epsilon, seed=42, orthogonal=True,
+            return_query_bins=True, return_topk_distances=True)
+        result = apply_coreset_after_topk(
+            topk_indices_list,
+            query_bits,
+            topk_distances=topk_distances,
+            coreset_ratio=coreset_ratio,
+            max_prefix_len=coreset_max_prefix_len,
+            seed=coreset_seed,
+            return_diagnostics=hashcoreset_diagnostics,
+        )
+        if hashcoreset_diagnostics:
+            topk_indices_list, reps, assign, diagnostics = result
+            print_hashcoreset_diagnostics("t2i", diagnostics)
+        else:
+            topk_indices_list, reps, assign = result
+        if prune_to_coreset_reps:
+            selected_query_indices = reps.cpu().tolist()
+        print(
+            f"[HashCoreset t2i] coreset_ratio={coreset_ratio} "
+            f"reps={int(reps.numel())}/{int(assign.numel())} "
+            f"pruned_train_queries={len(selected_query_indices) if selected_query_indices is not None else len(topk_indices_list)}"
+        )
     else:
         raise ValueError(f"Unsupported distance metric: {distance}")
 
     new_dataset = []
-    for i, topk_indices in enumerate(topk_indices_list):
+    query_indices = selected_query_indices if selected_query_indices is not None else range(len(topk_indices_list))
+    for i in query_indices:
+        topk_indices = topk_indices_list[i]
         text_emb = txt_embeddings[i]
         topk_img_emb = img_embeddings[topk_indices]  # [topk, D]
 
@@ -512,7 +938,18 @@ def compute_topk_Hamming_indices(img_embeddings, txt_embeddings, topk=5, chunk_s
 
     return topk_indices_list
 
-def compute_private_hamming_topk_indices(img_embeddings, txt_embeddings, k=5, chunk_size=512, epsilon=0.1, r=10, seed=42, orthogonal=True):
+def compute_private_hamming_topk_indices(
+    img_embeddings,
+    txt_embeddings,
+    k=5,
+    chunk_size=512,
+    epsilon=0.1,
+    r=10,
+    seed=42,
+    orthogonal=True,
+    *,
+    return_query_bins: bool = False,
+):
     img_embeddings = normalize_embeddings(img_embeddings)
     txt_embeddings = normalize_embeddings(txt_embeddings)
     shift = estimate_shift(img_embeddings, txt_embeddings)  # [D]
@@ -548,6 +985,8 @@ def compute_private_hamming_topk_indices(img_embeddings, txt_embeddings, k=5, ch
         topk_indices_chunk = topk_indices_chunk.cpu().tolist()
         topk_indices.extend(topk_indices_chunk)
 
+    if return_query_bins:
+        return topk_indices, img_bins
     return topk_indices
 
 
@@ -575,7 +1014,23 @@ def compute_bit_flipping_topk_indices(img_embeddings, txt_embeddings, k=5, chunk
 
     return topk_indices
 
-def compute_TPOneHot_topk_indices(img_embeddings, txt_embeddings, k=5, chunk_size=512, epsilon=0.1, seed=42, orthogonal=True):
+def compute_TPOneHot_topk_indices(
+    img_embeddings,
+    txt_embeddings,
+    k=5,
+    chunk_size=512,
+    epsilon=0.1,
+    seed=42,
+    orthogonal=True,
+    *,
+    return_query_bins: bool = False,
+    return_topk_distances: bool = False,
+):
+    """
+    When `return_query_bins=True`, returns the query-side binary representation used by
+    HashCoreset bucketing. We return the TPOneHot-side bit-flipped codes instead of the
+    original LSH bits so that coreset grouping matches the retrieval space.
+    """
     img_embeddings = normalize_embeddings(img_embeddings)
     txt_embeddings = normalize_embeddings(txt_embeddings)
     shift = estimate_shift(img_embeddings, txt_embeddings)  # [D]
@@ -599,17 +1054,122 @@ def compute_TPOneHot_topk_indices(img_embeddings, txt_embeddings, k=5, chunk_siz
 
     N_img = img_flipped.shape[0]
     topk_indices = []
+    topk_distances = []
 
     for start in tqdm(range(0, N_img, chunk_size), desc='Computing top-k indices'):
         end= min(start + chunk_size, N_img)
         img_chunk = img_flipped[start:end]
         raw = compute_hamming_distance_chunked(img_chunk, txt_flipped)
         # topk-k
-        _, topk_indices_chunk = torch.topk(-raw, k=k, dim=1)
+        topk_negdist_chunk, topk_indices_chunk = torch.topk(-raw, k=k, dim=1)
         topk_indices_chunk = topk_indices_chunk.cpu().tolist()
+        topk_distances_chunk = (-topk_negdist_chunk).to(torch.long).cpu().tolist()
         topk_indices.extend(topk_indices_chunk)
+        topk_distances.extend(topk_distances_chunk)
 
+    if return_query_bins and return_topk_distances:
+        return topk_indices, img_flipped.to(torch.bool), topk_distances
+    if return_query_bins:
+        return topk_indices, img_flipped.to(torch.bool)
+    if return_topk_distances:
+        return topk_indices, topk_distances
     return topk_indices
+
+
+def compute_TPOneHot_bidirectional_topk_indices(
+    img_embeddings,
+    txt_embeddings,
+    k=5,
+    chunk_size=512,
+    epsilon=0.1,
+    seed=42,
+    orthogonal=True,
+    *,
+    return_query_bins: bool = False,
+    return_topk_distances: bool = False,
+):
+    """
+    Compute i2t and t2i top-k tables in one pass over the chunked distance matrix.
+
+    The expensive Hamming distance block `raw = dist(img_chunk, txt_all)` is shared:
+    - row top-k gives image -> text candidates
+    - column top-k is updated incrementally to give text -> image candidates
+    """
+    img_embeddings = normalize_embeddings(img_embeddings)
+    txt_embeddings = normalize_embeddings(txt_embeddings)
+    shift = estimate_shift(img_embeddings, txt_embeddings)
+    if orthogonal:
+        lsh_projections = generate_orthogonal_lsh_projections(shift, dim=img_embeddings.size(1), num_vecs=512)
+    else:
+        lsh_projections = generate_random_lsh_vectors(dim=img_embeddings.size(1), num_vecs=512)
+    img_bins = lsh_hash_bits(img_embeddings, lsh_projections)
+    txt_bins = lsh_hash_bits(txt_embeddings, lsh_projections)
+
+    H0, H1, m = generate_tpoh_hashes(n=img_bins.size(1))
+    img_encoded = encode_tpoh_torch(img_bins, H0, H1, m)
+    txt_encoded = encode_tpoh_torch(txt_bins, H0, H1, m)
+
+    img_flipped = bit_flip_matrix_torch(img_encoded, epsilon)
+    txt_flipped = bit_flip_matrix_torch(txt_encoded, epsilon)
+
+    print(img_flipped.shape)
+
+    device = img_flipped.device
+    N_img = img_flipped.shape[0]
+    N_txt = txt_flipped.shape[0]
+
+    i2t_topk_indices = []
+    i2t_topk_distances = []
+
+    inf_dist = torch.full((N_txt, k), float("inf"), device=device, dtype=torch.float32)
+    neg_one_idx = torch.full((N_txt, k), -1, device=device, dtype=torch.long)
+    best_t2i_dist = inf_dist
+    best_t2i_idx = neg_one_idx
+
+    for start in tqdm(range(0, N_img, chunk_size), desc='Computing bidirectional top-k indices'):
+        end = min(start + chunk_size, N_img)
+        img_chunk = img_flipped[start:end]
+        raw = compute_hamming_distance_chunked(img_chunk, txt_flipped)  # [B, N_txt]
+
+        # image -> text: row-wise top-k
+        row_topk_negdist, row_topk_idx = torch.topk(-raw, k=k, dim=1)
+        i2t_topk_indices.extend(row_topk_idx.cpu().tolist())
+        i2t_topk_distances.extend((-row_topk_negdist).to(torch.long).cpu().tolist())
+
+        # text -> image: maintain column-wise top-k incrementally
+        chunk_dist_t = raw.transpose(0, 1)  # [N_txt, B]
+        chunk_img_idx = torch.arange(start, end, device=device, dtype=torch.long)
+        chunk_img_idx = chunk_img_idx.unsqueeze(0).expand(N_txt, -1)  # [N_txt, B]
+
+        merged_dist = torch.cat([best_t2i_dist, chunk_dist_t], dim=1)
+        merged_idx = torch.cat([best_t2i_idx, chunk_img_idx], dim=1)
+
+        best_t2i_negdist, select = torch.topk(-merged_dist, k=k, dim=1)
+        best_t2i_dist = -best_t2i_negdist
+        best_t2i_idx = torch.gather(merged_idx, 1, select)
+
+    t2i_topk_indices = best_t2i_idx.cpu().tolist()
+    t2i_topk_distances = best_t2i_dist.to(torch.long).cpu().tolist()
+
+    if return_query_bins and return_topk_distances:
+        return (
+            i2t_topk_indices,
+            t2i_topk_indices,
+            img_flipped.to(torch.bool),
+            txt_flipped.to(torch.bool),
+            i2t_topk_distances,
+            t2i_topk_distances,
+        )
+    if return_query_bins:
+        return (
+            i2t_topk_indices,
+            t2i_topk_indices,
+            img_flipped.to(torch.bool),
+            txt_flipped.to(torch.bool),
+        )
+    if return_topk_distances:
+        return i2t_topk_indices, t2i_topk_indices, i2t_topk_distances, t2i_topk_distances
+    return i2t_topk_indices, t2i_topk_indices
 
 def compute_bidirectional_mappings(img_embeddings, txt_embeddings,
                                    topk_text=5, topk_image=5,

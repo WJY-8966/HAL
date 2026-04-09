@@ -22,7 +22,8 @@ def generate_random_lsh_vectors(dim, num_vecs):
     Returns:
         torch.Tensor: shape [num_vecs, dim]
     """
-    rand_vecs = torch.randn(num_vecs, dim).to('cuda:0')  # generate random vectors
+    # NOTE: do NOT hardcode CUDA here; caller may run on CPU-only torch.
+    rand_vecs = torch.randn(num_vecs, dim)  # generate random vectors on CPU by default
     rand_vecs = F.normalize(rand_vecs, dim=1)  # L2 normalize
     return rand_vecs
 
